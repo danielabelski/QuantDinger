@@ -575,7 +575,7 @@ order_target_percent(
 )
 ~~~
 
-或设置后续开仓的默认保护：
+或在可执行处理器/定时回调中、下单之前设置后续开仓的默认保护（不要在 <code>initialize</code> 中调用；清单发现阶段不会保留运行时保护状态）：
 
 ~~~python
 set_default_protection(

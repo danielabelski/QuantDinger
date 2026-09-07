@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.ai_generation_contracts import SCRIPT_STRATEGY_SYSTEM_PROMPT
+from app.services.strategy_ai_capabilities import strategy_ai_capability_catalog
+from app.services.strategy_direction import DIRECTION_MODES
 
 
 _STARTER_TEMPLATE = '''"""
@@ -32,7 +34,11 @@ def handle_data(context, data):
         return
     close = float(bars["close"].iloc[-1])
     average = float(bars["close"].tail(period).mean())
-    order_target_percent(g.symbol, target_pct if close > average else 0.0)
+    order_target_percent(
+        g.symbol,
+        target_pct if close > average else 0.0,
+        reason="daily_ma_regime_target",
+    )
 '''
 
 _MULTI_TIMEFRAME_TEMPLATE = '''"""
@@ -48,6 +54,7 @@ def initialize(context):
     context.subscribe(frequency="1h")
     context.set_warmup(62)
     context.allow_leverage(max_leverage=5)
+    context.set_metadata(direction_mode="long_only", strategy_family="trend")
 
 
 def handle_data(context, data):
@@ -65,19 +72,29 @@ def handle_data(context, data):
     hourly_bullish = float(bars_1h["close"].tail(20).mean()) > float(
         bars_1h["close"].tail(50).mean()
     )
-    position = get_position(g.symbol)
+    position = get_position(g.symbol, position_side="long")
     amount = float(position.amount or 0.0)
     if amount <= 0 and golden_cross and hourly_bullish:
-        order_target_percent(g.symbol, 0.5, reason="one_minute_cross_hourly_confirmed")
+        order_target_percent(
+            g.symbol,
+            0.5,
+            position_side="long",
+            reason="one_minute_cross_hourly_confirmed",
+        )
     elif amount > 0 and (death_cross or not hourly_bullish):
-        order_target_percent(g.symbol, 0.0, reason="cross_or_hourly_filter_exit")
+        order_target_percent(
+            g.symbol,
+            0.0,
+            position_side="long",
+            reason="cross_or_hourly_filter_exit",
+        )
 '''
 
 
 def get_strategy_authoring_contract() -> dict[str, Any]:
     """Return the canonical source-ownership and runtime API contract."""
     return {
-        "version": "strategy-api-v2-native-multitimeframe-2026-08",
+        "version": "strategy-api-v2-capability-packs-2026-09",
         "doc": "docs/trading/STRATEGY_DEV_GUIDE.md",
         "workflow": [
             "1. Fetch this contract before generating Strategy API V2 source.",
@@ -132,6 +149,15 @@ def get_strategy_authoring_contract() -> dict[str, Any]:
                 "Guard each timeframe's returned history length independently.",
             ],
         },
+        "direction_modes": {
+            "allowed": sorted(DIRECTION_MODES),
+            "bidirectional": "both",
+            "swap_rule": (
+                "Every new Crypto swap strategy declares direction_mode and passes "
+                "position_side on each contract position read and order."
+            ),
+        },
+        "capability_packs": strategy_ai_capability_catalog(),
         "system_contract": SCRIPT_STRATEGY_SYSTEM_PROMPT,
         "starter_template": _STARTER_TEMPLATE,
         "multi_timeframe_template": _MULTI_TIMEFRAME_TEMPLATE,

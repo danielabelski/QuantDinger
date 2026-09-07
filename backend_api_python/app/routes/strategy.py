@@ -19,8 +19,15 @@ from app.services.ai_generation_contracts import (
 from app.services.ai_copilot_context import fit_messages_to_budget
 from app.services.strategy_ai_generation import (
     build_strategy_generation_request,
+    build_strategy_system_prompt,
     select_strategy_system_prompt,
     validate_generated_strategy,
+)
+from app.services.strategy_ai_capabilities import (
+    StrategyAIGenerationIntent,
+    render_strategy_capability_contract,
+    render_strategy_capability_repairs,
+    resolve_strategy_generation_intent,
 )
 from app.services.strategy_ai_workspace import (
     begin_strategy_ai_turn,
@@ -275,7 +282,13 @@ def generate_strategy():
         generation_mode = str(payload.get("generationMode") or "authoring").strip().lower()
         context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
         existing_code = str(payload.get("existingCode") or "").strip()
-        system_prompt = select_strategy_system_prompt(asset_type, generation_mode)
+        system_prompt, generation_intent = build_strategy_system_prompt(
+            prompt=prompt,
+            asset_type=asset_type,
+            existing_code=existing_code,
+            generation_mode=generation_mode,
+            context=context,
+        )
         user_prompt = build_strategy_generation_request(
             prompt=prompt,
             asset_type=asset_type,
@@ -308,6 +321,7 @@ def generate_strategy():
             generation_mode=generation_mode,
             context=context,
             system_prompt=system_prompt,
+            intent=generation_intent,
         )
         return _ok({"code": code, "manifest": program.manifest.metadata()})
     except Exception as exc:
@@ -331,44 +345,59 @@ def _compile_or_repair_generated_strategy(
     generation_mode: str = "authoring",
     context: dict | None = None,
     system_prompt: str | None = None,
+    intent: StrategyAIGenerationIntent | None = None,
+    max_repair_attempts: int = 2,
 ):
     selected_system_prompt = system_prompt or select_strategy_system_prompt(asset_type, generation_mode)
-    try:
-        return code, validate_generated_strategy(
-            code,
-            asset_type=asset_type,
-            generation_mode=generation_mode,
-            context=context,
-            compiler=compile_strategy_v2,
-        )
-    except Exception as first_error:
-        logger.info("repairing invalid generated strategy: %s", first_error)
-        repair_prompt = "\n\n".join(
-            [
-                SCRIPT_STRATEGY_REPAIR_REQUIREMENTS,
-                f"Original user request:\n{prompt}",
-                f"Validation error:\n{first_error}",
-                f"Invalid generated source:\n{code}",
-                "Repair the source and return the complete Python source only.",
-            ]
-        )
-        repaired_content = llm.call_llm_api(
-            messages=[
-                {"role": "system", "content": selected_system_prompt},
-                {"role": "user", "content": repair_prompt},
-            ],
-            model=llm.get_code_generation_model(),
-            temperature=0.15,
-            use_json_mode=False,
-        )
-        repaired_code = _strip_code_fence(str(repaired_content or ""))
-        return repaired_code, validate_generated_strategy(
-            repaired_code,
-            asset_type=asset_type,
-            generation_mode=generation_mode,
-            context=context,
-            compiler=compile_strategy_v2,
-        )
+    resolved_intent = intent or resolve_strategy_generation_intent(
+        prompt=prompt,
+        context=context,
+    )
+    candidate = code
+    attempts = max(0, min(int(max_repair_attempts), 3))
+    for attempt in range(attempts + 1):
+        try:
+            return candidate, validate_generated_strategy(
+                candidate,
+                asset_type=asset_type,
+                generation_mode=generation_mode,
+                context=context,
+                prompt=prompt,
+                intent=resolved_intent,
+                compiler=compile_strategy_v2,
+            )
+        except Exception as validation_error:
+            if attempt >= attempts:
+                raise
+            logger.info(
+                "repairing invalid generated strategy attempt=%s/%s: %s",
+                attempt + 1,
+                attempts,
+                validation_error,
+            )
+            capability_repairs = render_strategy_capability_repairs(resolved_intent)
+            repair_prompt = "\n\n".join(
+                [
+                    SCRIPT_STRATEGY_REPAIR_REQUIREMENTS,
+                    capability_repairs,
+                    f"Original user request:\n{prompt}",
+                    f"Validation error to repair now:\n{validation_error}",
+                    f"Invalid generated source:\n{candidate}",
+                    "Repair the source and return the complete Python source only.",
+                ]
+            )
+            repaired_content = llm.call_llm_api(
+                messages=[
+                    {"role": "system", "content": selected_system_prompt},
+                    {"role": "user", "content": repair_prompt},
+                ],
+                model=llm.get_code_generation_model(),
+                temperature=0.15,
+                use_json_mode=False,
+            )
+            candidate = _strip_code_fence(str(repaired_content or ""))
+
+    raise RuntimeError("strategyV2.generationRepairExhausted")
 
 
 def _strategy_ai_billing_feature(intent: str) -> str:
@@ -500,11 +529,20 @@ def run_strategy_workspace_turn():
                 existing_code = str(workspace["source"].get("code") or "")
 
         if intent == "discussion":
+            discussion_intent = resolve_strategy_generation_intent(
+                prompt=prompt,
+                existing_code=existing_code,
+                context=context,
+            )
+            discussion_contract = render_strategy_capability_contract(discussion_intent)
             discussion_system = (
                 "You are QuantDinger's Strategy API V2 code reviewer. Answer in the user's language. "
                 "Explain the current strategy's universe, market type, subscriptions, signals, sizing, risk, and limitations. "
-                "Never claim code was changed and never return replacement source. Be concise and concrete."
+                "Never claim code was changed and never return replacement source. Be concise and concrete. "
+                "Treat the active capability contract below as authoritative platform behavior and distinguish it from behavior actually implemented by the source."
             )
+            if discussion_contract:
+                discussion_system = f"{discussion_system}\n\n{discussion_contract}"
             messages = [{"role": "system", "content": discussion_system}]
             if workspace:
                 messages.append({
@@ -544,7 +582,13 @@ def run_strategy_workspace_turn():
                 **billing_meta,
             })
 
-        system_prompt = select_strategy_system_prompt(asset_type, generation_mode)
+        system_prompt, generation_intent = build_strategy_system_prompt(
+            prompt=prompt,
+            asset_type=asset_type,
+            existing_code=existing_code,
+            generation_mode=generation_mode,
+            context=context,
+        )
         user_prompt = build_strategy_generation_request(
             prompt=prompt,
             asset_type=asset_type,
@@ -585,6 +629,7 @@ def run_strategy_workspace_turn():
             generation_mode=generation_mode,
             context=context,
             system_prompt=system_prompt,
+            intent=generation_intent,
         )
         manifest = program.manifest.metadata()
         validation = {"success": True, "manifest": manifest}

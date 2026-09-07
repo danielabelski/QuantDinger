@@ -9,6 +9,12 @@ from app.services.ai_generation_contracts import (
     INDICATOR_TO_STRATEGY_SYSTEM_PROMPT,
     PORTFOLIO_STRATEGY_SYSTEM_PROMPT,
 )
+from app.services.strategy_ai_capabilities import (
+    StrategyAIGenerationIntent,
+    render_strategy_capability_contract,
+    resolve_strategy_generation_intent,
+    validate_strategy_ai_semantics,
+)
 from app.services.strategy_ai_workspace import normalize_asset_type
 from app.services.strategy_v2 import StrategyV2ContractError, compile_strategy_v2
 from app.services.strategy_v2.instruments import normalize_frequency, parse_instrument
@@ -24,6 +30,25 @@ def select_strategy_system_prompt(asset_type: str, generation_mode: str = "autho
     if normalized_type == "portfolio_strategy":
         return PORTFOLIO_STRATEGY_SYSTEM_PROMPT
     return CTA_STRATEGY_SYSTEM_PROMPT
+
+
+def build_strategy_system_prompt(
+    *,
+    prompt: str,
+    asset_type: str,
+    existing_code: str = "",
+    generation_mode: str = "authoring",
+    context: dict | None = None,
+) -> tuple[str, StrategyAIGenerationIntent]:
+    """Build a compact base prompt plus only the relevant capability packs."""
+    base = select_strategy_system_prompt(asset_type, generation_mode)
+    intent = resolve_strategy_generation_intent(
+        prompt=prompt,
+        existing_code=existing_code,
+        context=context,
+    )
+    capability_contract = render_strategy_capability_contract(intent)
+    return (f"{base}\n\n{capability_contract}" if capability_contract else base), intent
 
 
 def _canonical_instrument(value: Any) -> str:
@@ -47,6 +72,11 @@ def build_strategy_generation_request(
     instrument = _canonical_instrument(context.get("instrument") or context.get("sourceInstrument"))
     timeframe_raw = context.get("timeframe") or context.get("sourceTimeframe")
     timeframe = normalize_frequency(timeframe_raw) if str(timeframe_raw or "").strip() else ""
+    intent = resolve_strategy_generation_intent(
+        prompt=prompt,
+        existing_code=existing_code,
+        context=context,
+    )
     constraints = {
         "workspace_asset_type": normalized_type,
         "required_manifest_strategy_type": expected_manifest,
@@ -54,6 +84,8 @@ def build_strategy_generation_request(
         "required_instrument": instrument,
         "required_timeframe": timeframe,
         "current_source_is_truth": bool(str(existing_code or "").strip()),
+        "requested_capabilities": list(intent.capabilities),
+        "requested_direction_mode": intent.requested_direction_mode,
     }
     parts = [
         "# Structured IDE constraints (machine-enforced after generation)",
@@ -81,6 +113,9 @@ def validate_generated_strategy(
     asset_type: str,
     generation_mode: str = "authoring",
     context: dict | None = None,
+    prompt: str = "",
+    existing_code: str = "",
+    intent: StrategyAIGenerationIntent | None = None,
     compiler: Callable[[str], Any] = compile_strategy_v2,
 ):
     normalized_type = normalize_asset_type(asset_type)
@@ -114,4 +149,10 @@ def validate_generated_strategy(
     mode = str(generation_mode or "authoring").strip().lower()
     if mode == "indicator_conversion" and manifest.strategy_type != "cta":
         raise StrategyV2ContractError("strategyV2.indicatorConversionCtaOnly")
+    resolved_intent = intent or resolve_strategy_generation_intent(
+        prompt=prompt,
+        existing_code=existing_code,
+        context=context,
+    )
+    validate_strategy_ai_semantics(code, manifest, resolved_intent)
     return program

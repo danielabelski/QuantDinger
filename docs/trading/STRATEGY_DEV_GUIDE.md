@@ -573,7 +573,7 @@ order_target_percent(
 )
 ~~~
 
-Or set defaults for later entries:
+Or set defaults inside an executable handler/scheduled callback before later entries (do not call this in <code>initialize</code>; manifest discovery does not retain runtime protection state):
 
 ~~~python
 set_default_protection(

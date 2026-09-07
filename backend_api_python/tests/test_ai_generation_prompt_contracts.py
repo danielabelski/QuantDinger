@@ -179,3 +179,46 @@ def test_strategy_generator_repairs_invalid_model_output_once(monkeypatch):
     assert len(llm.calls) == 1
     assert llm.calls[0]["temperature"] == 0.15
     assert SCRIPT_STRATEGY_REPAIR_REQUIREMENTS in llm.calls[0]["messages"][1]["content"]
+
+
+def test_strategy_generator_uses_a_bounded_second_error_directed_repair(monkeypatch):
+    from app.routes import strategy as strategy_route
+
+    compile_calls = []
+
+    class FakeManifest:
+        strategy_type = "cta"
+
+    class FakeProgram:
+        manifest = FakeManifest()
+
+    def fake_compile(code):
+        compile_calls.append(code)
+        if code != "valid source":
+            raise ValueError(f"invalid:{code}")
+        return FakeProgram()
+
+    class FakeLLM:
+        def __init__(self):
+            self.calls = []
+
+        def call_llm_api(self, **kwargs):
+            self.calls.append(kwargs)
+            return "still invalid" if len(self.calls) == 1 else "valid source"
+
+        def get_code_generation_model(self):
+            return "test-model"
+
+    monkeypatch.setattr(strategy_route, "compile_strategy_v2", fake_compile)
+    llm = FakeLLM()
+
+    code, _program = strategy_route._compile_or_repair_generated_strategy(
+        llm,
+        "Build a moving-average strategy",
+        "first invalid",
+    )
+
+    assert code == "valid source"
+    assert compile_calls == ["first invalid", "still invalid", "valid source"]
+    assert len(llm.calls) == 2
+    assert "invalid:still invalid" in llm.calls[1]["messages"][1]["content"]

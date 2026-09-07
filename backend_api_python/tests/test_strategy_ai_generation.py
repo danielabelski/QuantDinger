@@ -43,7 +43,7 @@ def handle_data(context, data):
     if len(bars) < 25:
         return
     target = 0.8 if float(bars["close"].iloc[-1]) > float(bars["close"].tail(20).mean()) else 0.0
-    order_target_percent(g.symbol, target)
+    order_target_percent(g.symbol, target, reason="btc_spot_trend_target")
 '''
 
 
@@ -61,7 +61,24 @@ def initialize(context):
     context.set_metadata(direction_mode="both")
 
 def handle_data(context, data):
-    pass
+    bars = get_history(2, "4h", "close", g.symbol)
+    if len(bars) < 2:
+        return
+    rising = float(bars["close"].iloc[-1]) > float(bars["close"].iloc[-2])
+    get_position(g.symbol, position_side="long")
+    get_position(g.symbol, position_side="short")
+    order_target_percent(
+        g.symbol,
+        0.5 if rising else 0.0,
+        position_side="long",
+        reason="eth_swap_long_target",
+    )
+    order_target_percent(
+        g.symbol,
+        0.0 if rising else -0.5,
+        position_side="short",
+        reason="eth_swap_short_target",
+    )
 '''
 
 
@@ -100,10 +117,10 @@ def rebalance(context, data):
     positions = get_positions()
     for symbol in positions.keys():
         if symbol not in selected:
-            order_target_percent(symbol, 0.0)
+            order_target_percent(symbol, 0.0, reason="weekly_selection_exit")
     weight = 1.0 / len(selected) if selected else 0.0
     for symbol in selected:
-        order_target_percent(symbol, weight)
+        order_target_percent(symbol, weight, reason="weekly_selection_target")
 '''
 
 
