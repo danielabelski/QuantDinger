@@ -50,6 +50,26 @@ def handle_data(context, data):
 '''
 
 
+NATIVE_RSI_SOURCE = '''"""Native RSI runtime behavior test."""
+
+def initialize(context):
+    g.symbol = "USStock:SPY"
+    context.set_universe([g.symbol])
+    context.subscribe(frequency="1h")
+    context.set_warmup(30)
+    context.set_metadata(direction_mode="long_only")
+
+def handle_data(context, data):
+    values = indicator("rsi", g.symbol, period=14, frequency="1h").dropna()
+    if len(values) < 2:
+        return
+    previous = float(values.iloc[-2])
+    current = float(values.iloc[-1])
+    if previous <= 50 and current > 50:
+        order_target_percent(g.symbol, 0.2, reason="rsi_open_long")
+'''
+
+
 def _intent():
     return resolve_strategy_generation_intent(
         prompt="ETH 永续 Supertrend 多空双向，3% 止损和 6% 止盈"
@@ -88,3 +108,22 @@ def test_runtime_smoke_rejects_static_order_paths_that_never_execute():
 
     with pytest.raises(StrategyV2ContractError, match="aiBehaviorOpenLegMissing:long,short"):
         validate_strategy_ai_behavior(source, program.manifest, intent)
+
+
+def test_runtime_smoke_applies_to_any_registered_technical_factor():
+    intent = resolve_strategy_generation_intent(prompt="使用 RSI 构建 SPY 策略")
+    program = validate_generated_strategy(
+        NATIVE_RSI_SOURCE,
+        asset_type="script",
+        intent=intent,
+    )
+
+    result = validate_strategy_ai_behavior(
+        NATIVE_RSI_SOURCE,
+        program.manifest,
+        intent,
+    )
+
+    assert intent.factor_ids == ("rsi",)
+    assert result["executed"] is True
+    assert result["opened_sides"] == ["long"]

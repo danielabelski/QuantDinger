@@ -74,7 +74,25 @@ def test_supertrend_request_loads_the_canonical_indicator_capability():
     intent = resolve_strategy_generation_intent(prompt="构建 ETH 永续 Supertrend 策略")
 
     assert "supertrend" in intent.capabilities
+    assert "technical_factors" in intent.capabilities
+    assert intent.factor_ids == ("supertrend",)
+    assert intent.required_factor_ids == ("supertrend",)
     assert "crypto_swap" in intent.capabilities
+
+
+def test_registered_factor_resolver_selects_only_requested_factor_definitions():
+    prompt, intent = build_strategy_system_prompt(
+        prompt="构建使用 MACD 和 KDJ 的 BTC 永续策略",
+        asset_type="script",
+    )
+
+    assert intent.factor_ids == ("kdj", "macd")
+    assert intent.required_factor_ids == ("kdj", "macd")
+    assert "technical_factors" in intent.capabilities
+    assert '"kdj": {' in prompt
+    assert '"macd": {' in prompt
+    assert '"rsi": {' not in prompt
+    assert "Never guess output names or parameter aliases" in prompt
 
 
 def test_generation_prompt_injects_only_relevant_capability_packs():
@@ -107,6 +125,89 @@ def test_structured_request_exposes_machine_readable_capability_intent():
     assert '"requested_direction_mode": "both"' in request
     assert '"bidirectional"' in request
     assert '"crypto_swap"' in request
+
+    factor_request = build_strategy_generation_request(
+        prompt="使用 RSI 和布林带",
+        asset_type="script",
+    )
+    assert '"requested_factor_ids": ["bollinger_bands", "rsi"]' in factor_request
+
+
+def test_existing_factor_context_is_active_but_not_a_new_hard_requirement():
+    source = _swap_source(
+        direction_mode="long_only",
+        body='''    # Legacy KDJ implementation remains valid for an unrelated edit.
+    values = indicator("MACD", g.symbol, output="histogram")
+    if len(values.dropna()) >= 2:
+        order_target_percent(
+            g.symbol, 0.4, position_side="long", reason="macd_entry"
+        )''',
+    )
+    intent = resolve_strategy_generation_intent(
+        prompt="我让你改啊",
+        existing_code=source,
+    )
+
+    assert intent.factor_ids == ("macd",)
+    assert intent.required_factor_ids == ()
+    validate_generated_strategy(source, asset_type="script", intent=intent)
+
+
+def test_requested_registered_factor_must_be_used_through_native_api():
+    source = '''"""SPY factor contract test."""
+
+def initialize(context):
+    g.symbol = "USStock:SPY"
+    context.set_universe([g.symbol])
+    context.subscribe(frequency="1d")
+    context.set_metadata(direction_mode="long_only")
+
+def handle_data(context, data):
+    order_target_percent(g.symbol, 0.2, reason="entry")
+'''
+
+    with pytest.raises(StrategyV2ContractError, match="aiRequestedFactorMissing:rsi"):
+        validate_generated_strategy(
+            source,
+            asset_type="script",
+            prompt="使用 RSI 构建策略",
+        )
+
+    native = source.replace(
+        '    order_target_percent(g.symbol, 0.2, reason="entry")',
+        '''    values = indicator("rsi", g.symbol, period=14).dropna()
+    if len(values) >= 2 and float(values.iloc[-1]) > 50:
+        order_target_percent(g.symbol, 0.2, reason="rsi_entry")''',
+    )
+    validate_generated_strategy(native, asset_type="script", prompt="使用 RSI 构建策略")
+
+
+@pytest.mark.parametrize(
+    "call,error",
+    [
+        ('indicator("rsi", g.symbol, timeperiod=14)', "aiFactorParameterUnsupported:rsi:timeperiod"),
+        ('indicator("rsi", g.symbol, period=0)', "aiFactorParameterInvalid:rsi:period"),
+        ('indicator("macd", g.symbol, output="unknown")', "aiFactorParameterInvalid:macd:output"),
+    ],
+)
+def test_requested_factor_parameters_follow_registry_schema(call, error):
+    source = '''"""Native factor parameter test."""
+
+def initialize(context):
+    g.symbol = "USStock:SPY"
+    context.set_universe([g.symbol])
+    context.subscribe(frequency="1d")
+    context.set_metadata(direction_mode="long_only")
+
+def handle_data(context, data):
+    values = FACTOR_CALL
+    if len(values.dropna()) >= 2:
+        order_target_percent(g.symbol, 0.2, reason="factor_entry")
+'''.replace("FACTOR_CALL", call)
+    prompt = "使用 MACD 构建策略" if '"macd"' in call else "使用 RSI 构建策略"
+
+    with pytest.raises(StrategyV2ContractError, match=error):
+        validate_generated_strategy(source, asset_type="script", prompt=prompt)
 
 
 def test_strict_authoring_rejects_metadata_only_bidirectional_strategy():
@@ -571,7 +672,13 @@ def test_external_authoring_contract_exports_same_capability_catalog():
         "persistent_state",
         "scheduling",
         "supertrend",
+        "technical_factors",
     }
+    factor_catalog = {
+        item["factor_id"]: item for item in contract["technical_factor_catalog"]
+    }
+    assert {"macd", "kdj", "rsi", "supertrend"} <= set(factor_catalog)
+    assert factor_catalog["macd"]["parameter_schema"]
     assert contract["capability_packs"]["crypto_swap"]["rules"]["position_sides"] == [
         "long",
         "short",

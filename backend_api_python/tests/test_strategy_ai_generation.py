@@ -6,6 +6,7 @@ from app.services.ai_generation_contracts import (
     PORTFOLIO_STRATEGY_SYSTEM_PROMPT,
 )
 from app.services.strategy_ai_generation import (
+    apply_deterministic_strategy_edit,
     build_strategy_generation_request,
     select_strategy_system_prompt,
     validate_generated_strategy,
@@ -206,6 +207,63 @@ def test_strategy_workspace_memory_is_bounded_and_asset_scoped():
     assert RECENT_MESSAGE_LIMIT <= WORKSPACE_MESSAGE_LIMIT <= 100
     assert classify_strategy_ai_intent("解释当前止损逻辑") == "discussion"
     assert classify_strategy_ai_intent("把止损改成 ATR 两倍") == "modify"
+    assert classify_strategy_ai_intent("我让你直接在代码里改啊") == "modify"
+    assert classify_strategy_ai_intent("我让你改啊") == "modify"
+    assert classify_strategy_ai_intent("不要再解释，直接改代码") == "modify"
+
+
+def test_single_timeframe_edit_is_minimal_and_updates_runtime_dependencies():
+    result = apply_deterministic_strategy_edit(
+        CTA_SWAP,
+        "把策略周期从 4h 改成 1h",
+    )
+
+    assert result is not None
+    candidate, plan = result
+    assert candidate == CTA_SWAP.replace('"4h"', '"1h"')
+    assert plan == {
+        "executor": "deterministic",
+        "operation": "set_single_timeframe",
+        "from": "4h",
+        "to": "1h",
+        "changed": True,
+        "replacement_count": 2,
+        "resolved_from": "把策略周期从 4h 改成 1h",
+    }
+    program = validate_generated_strategy(candidate, asset_type="script")
+    assert program.manifest.frequencies == ("1h",)
+
+
+def test_referential_followup_resolves_previous_timeframe_request():
+    result = apply_deterministic_strategy_edit(
+        CTA_SWAP,
+        "我让你直接在代码里改啊",
+        summary={"timeframe": "1h"},
+        recent_messages=[
+            {"role": "user", "content": "把策略周期从 4h 改成 1h"},
+            {"role": "assistant", "content": "需要将 frequency 改为 1h。"},
+        ],
+    )
+
+    assert result is not None
+    candidate, plan = result
+    assert 'context.subscribe(frequency="1h")' in candidate
+    assert 'get_history(2, "1h", "close", g.symbol)' in candidate
+    assert plan["resolved_from"] == "把策略周期从 4h 改成 1h"
+
+
+def test_deterministic_editor_falls_through_for_broad_or_ambiguous_requests():
+    assert apply_deterministic_strategy_edit(
+        CTA_SWAP,
+        "把周期改成 1h，并增加止损",
+    ) is None
+    assert apply_deterministic_strategy_edit(
+        CTA_SWAP.replace(
+            '    context.subscribe(frequency="4h")',
+            '    context.subscribe(frequency="4h")\n    context.subscribe(frequency="1d")',
+        ),
+        "把周期改成 1h",
+    ) is None
 
 
 @pytest.mark.parametrize("metadata", [{"code_hidden": True}, {"hide_code": True}])

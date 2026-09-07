@@ -18,7 +18,7 @@ from app.services.strategy_v2 import StrategyV2BacktestRunner
 from app.services.strategy_v2.contract import StrategyV2ContractError
 
 
-_OBSERVABLE_CAPABILITIES = {"bidirectional", "supertrend"}
+_OBSERVABLE_CAPABILITIES = {"bidirectional", "supertrend", "technical_factors"}
 _PANDAS_FREQUENCIES = {
     "1m": "min",
     "5m": "5min",

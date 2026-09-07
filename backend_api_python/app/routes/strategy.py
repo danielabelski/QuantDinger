@@ -18,6 +18,7 @@ from app.services.ai_generation_contracts import (
 )
 from app.services.ai_copilot_context import fit_messages_to_budget
 from app.services.strategy_ai_generation import (
+    apply_deterministic_strategy_edit,
     build_strategy_generation_request,
     build_strategy_system_prompt,
     select_strategy_system_prompt,
@@ -626,13 +627,23 @@ def run_strategy_workspace_turn():
         messages.append({"role": "user", "content": user_prompt})
         messages, budget = fit_messages_to_budget(messages, max_tokens=48000)
         logger.info("strategy authoring context budget=%s", budget)
-        generated = llm.call_llm_api(
-            messages=messages,
-            model=llm.get_code_generation_model(),
-            temperature=0.35,
-            use_json_mode=False,
+        deterministic_edit = apply_deterministic_strategy_edit(
+            existing_code,
+            prompt,
+            summary=(workspace or {}).get("summary") or {},
+            recent_messages=(workspace or {}).get("recent_messages") or [],
         )
-        candidate_code = _strip_code_fence(str(generated or ""))
+        if deterministic_edit:
+            candidate_code, edit_plan = deterministic_edit
+        else:
+            generated = llm.call_llm_api(
+                messages=messages,
+                model=llm.get_code_generation_model(),
+                temperature=0.35,
+                use_json_mode=False,
+            )
+            candidate_code = _strip_code_fence(str(generated or ""))
+            edit_plan = {"executor": "model", "operation": "generate_candidate"}
         candidate_code, program, behavior_validation = _compile_or_repair_generated_strategy(
             llm,
             user_prompt,
@@ -648,6 +659,7 @@ def run_strategy_workspace_turn():
             "success": True,
             "manifest": manifest,
             "behavior": behavior_validation,
+            "edit_plan": edit_plan,
         }
         assistant_text = _strategy_ai_text(STRATEGY_CANDIDATE_MESSAGE_KEY, lang)
         if workspace:

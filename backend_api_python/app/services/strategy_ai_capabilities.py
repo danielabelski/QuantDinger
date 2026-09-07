@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from app.services.factors.registry import list_factors
 from app.services.strategy_direction import DIRECTION_MODES, normalize_direction_mode
 from app.services.strategy_v2.contract import StrategyV2ContractError
 
@@ -76,11 +77,15 @@ class StrategyAICapability:
 class StrategyAIGenerationIntent:
     capabilities: tuple[str, ...]
     requested_direction_mode: str = ""
+    factor_ids: tuple[str, ...] = ()
+    required_factor_ids: tuple[str, ...] = ()
 
     def metadata(self) -> dict[str, Any]:
         return {
             "capabilities": list(self.capabilities),
             "requested_direction_mode": self.requested_direction_mode,
+            "active_factor_ids": list(self.factor_ids),
+            "requested_factor_ids": list(self.required_factor_ids),
         }
 
 
@@ -148,6 +153,28 @@ CAPABILITY_PACKS: dict[str, StrategyAICapability] = {
         repair="""
 - Replace custom ATR-band Supertrend implementations with the canonical `indicator("supertrend", ..., output="direction")` series.
 - Drop warmup `NaN` values before reading the final two direction values.
+""",
+    ),
+    "technical_factors": StrategyAICapability(
+        name="technical_factors",
+        summary="Canonical registered factor APIs selected for this strategy.",
+        rules={
+            "series_api": "indicator",
+            "scalar_api": "factor",
+            "warmup_handling": "dropna",
+            "registry_source": "app.services.factors.registry",
+        },
+        contract="""
+## Registered technical factors
+- When adding or changing a requested factor, use the canonical factor ID and parameters in its active definition. Do not reimplement it with ad-hoc rolling math.
+- Use `indicator(factor_id, symbol, **params)` when previous/current series values are needed for signals. Use `factor(factor_id, symbol, **params)` only when one current scalar value is sufficient.
+- `indicator(...)` returns a pandas Series for one output or a DataFrame for multiple outputs. Warmup values may be `NaN`; call `.dropna()` on the selected series and check its length before `.iloc` access.
+- Multi-output indicators must select a documented `output` or use the returned DataFrame columns. Never guess output names or parameter aliases.
+- A definition marked `requested` is a hard requirement for this turn. A definition marked only `existing` is context: preserve a working legacy or TA-Lib call when the user did not ask to change that factor.
+""",
+        repair="""
+- Replace manual implementations of requested registered factors with `indicator(...)` or `factor(...)` using the active factor definition.
+- Select the documented output, remove warmup `NaN` values, and guard completed-data length before reading signal values.
 """,
     ),
     "bidirectional": StrategyAICapability(
@@ -356,6 +383,22 @@ _SUPERTREND_TERMS = (
     "super trend",
     "超级趋势",
 )
+_FACTOR_ALIASES = {
+    "布林": "bollinger_bands",
+    "唐奇安": "donchian_channels",
+    "肯特纳": "keltner_channels",
+    "超级趋势": "supertrend",
+    "威廉指标": "williams_r",
+    "资金流量指标": "mfi",
+    "商品通道指标": "cci",
+}
+_LEGACY_FACTOR_ALIASES = {
+    "stoch": "stochastic",
+}
+_TECHNICAL_FACTOR_DEFINITIONS = {
+    str(item["factor_id"]): item
+    for item in list_factors(factor_type="technical")
+}
 _PERSISTENCE_TERMS = (
     "跨重启",
     "状态恢复",
@@ -383,6 +426,69 @@ _SCHEDULE_TERMS = (
 def _contains_any(text: str, terms: Iterable[str]) -> bool:
     lowered = text.lower()
     return any(term.lower() in lowered for term in terms)
+
+
+def _requested_factor_ids(text: str) -> tuple[str, ...]:
+    lowered = str(text or "").lower()
+    selected = {
+        factor_id
+        for factor_id in _TECHNICAL_FACTOR_DEFINITIONS
+        if any(
+            re.search(
+                rf"(?<![a-z0-9_]){re.escape(alias)}(?![a-z0-9_])",
+                lowered,
+            )
+            for alias in {
+                factor_id,
+                factor_id.replace("_", " "),
+                factor_id.replace("_", "-"),
+            }
+        )
+    }
+    selected.update(
+        factor_id
+        for alias, factor_id in _FACTOR_ALIASES.items()
+        if alias in lowered
+    )
+    return tuple(sorted(selected))
+
+
+def _source_factor_ids(source: str) -> tuple[str, ...]:
+    try:
+        tree = ast.parse(str(source or ""))
+    except SyntaxError:
+        return ()
+    selected: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        call_name = (
+            node.func.id
+            if isinstance(node.func, ast.Name)
+            else node.func.attr
+            if isinstance(node.func, ast.Attribute)
+            else ""
+        )
+        factor_node: ast.AST | None = None
+        if call_name in {"indicator", "factor"}:
+            factor_node = node.args[0] if node.args else next(
+                (item.value for item in node.keywords if item.arg == "name"),
+                None,
+            )
+        elif call_name == "get_factors":
+            factor_node = node.args[1] if len(node.args) > 1 else next(
+                (item.value for item in node.keywords if item.arg == "names"),
+                None,
+            )
+        values = factor_node.elts if isinstance(factor_node, (ast.List, ast.Tuple, ast.Set)) else [factor_node]
+        for value_node in values:
+            if not isinstance(value_node, ast.Constant) or not isinstance(value_node.value, str):
+                continue
+            factor_id = value_node.value.strip().lower().replace("-", "_").replace(" ", "_")
+            factor_id = _LEGACY_FACTOR_ALIASES.get(factor_id, factor_id)
+            if factor_id in _TECHNICAL_FACTOR_DEFINITIONS:
+                selected.add(factor_id)
+    return tuple(sorted(selected))
 
 
 def _requested_direction(prompt: str, existing_code: str) -> str:
@@ -415,11 +521,20 @@ def resolve_strategy_generation_intent(
     combined = "\n".join((str(prompt or ""), str(existing_code or ""), serialized_context))
     capabilities: set[str] = set()
     direction = _requested_direction(prompt, existing_code)
+    required_factor_ids = _requested_factor_ids(
+        "\n".join((str(prompt or ""), serialized_context))
+    )
+    factor_ids = tuple(sorted({
+        *required_factor_ids,
+        *_source_factor_ids(existing_code),
+    }))
 
     if re.search(r"@swap\b|usdtswap\b|usdt[ /_-]*swap\b|\bperpetual\b|永续", combined, re.IGNORECASE):
         capabilities.add("crypto_swap")
     if _contains_any(combined, _SUPERTREND_TERMS):
         capabilities.add("supertrend")
+    if factor_ids:
+        capabilities.add("technical_factors")
     if direction in {"both", "neutral"}:
         capabilities.update(("crypto_swap", "bidirectional"))
     if _contains_any(combined, _PROTECTION_TERMS):
@@ -439,7 +554,12 @@ def resolve_strategy_generation_intent(
     if isinstance(explicit, (list, tuple, set)):
         capabilities.update(str(item).strip() for item in explicit if str(item).strip() in CAPABILITY_PACKS)
 
-    return StrategyAIGenerationIntent(tuple(sorted(capabilities)), direction)
+    return StrategyAIGenerationIntent(
+        tuple(sorted(capabilities)),
+        direction,
+        factor_ids,
+        required_factor_ids,
+    )
 
 
 def render_strategy_capability_contract(intent: StrategyAIGenerationIntent) -> str:
@@ -451,6 +571,29 @@ def render_strategy_capability_contract(intent: StrategyAIGenerationIntent) -> s
         json.dumps(intent.metadata(), ensure_ascii=False, sort_keys=True),
     ]
     sections.extend(CAPABILITY_PACKS[name].contract.strip() for name in intent.capabilities)
+    if intent.factor_ids:
+        active_definitions = {
+            factor_id: {
+                "required_fields": definition["required_fields"],
+                "default_params": definition["default_params"],
+                "parameter_schema": definition["parameter_schema"],
+                "direction_hint": definition["direction_hint"],
+                "default_warmup_bars": definition["default_warmup_bars"],
+                "scope": (
+                    "requested"
+                    if factor_id in intent.required_factor_ids
+                    else "existing"
+                ),
+            }
+            for factor_id in intent.factor_ids
+            if (definition := _TECHNICAL_FACTOR_DEFINITIONS.get(factor_id))
+        }
+        sections.extend(
+            (
+                "## Active factor definitions",
+                json.dumps(active_definitions, ensure_ascii=False, sort_keys=True),
+            )
+        )
     return "\n\n".join(sections)
 
 
@@ -603,6 +746,23 @@ def _possible_text_values(
             return set()
         values.add(value)
     return values
+
+
+def _literal_text_values(
+    node: ast.AST | None,
+    static_strings: dict[str, str],
+) -> set[str]:
+    resolved = _resolved_text(node, static_strings)
+    if resolved:
+        return {resolved}
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        values: set[str] = set()
+        for item in node.elts:
+            value = _resolved_text(item, static_strings)
+            if value:
+                values.add(value)
+        return values
+    return set()
 
 
 def _literal_number(node: ast.AST | None) -> float | None:
@@ -1052,6 +1212,56 @@ def validate_strategy_ai_semantics(
         )
         if not native_supertrend:
             raise StrategyV2ContractError("strategyV2.aiSupertrendNativeRequired")
+
+    used_factor_ids: set[str] = set()
+    requested_factor_calls: list[tuple[str, ast.Call]] = []
+    for node in calls:
+        call_name = _call_name(node)
+        factor_node: ast.AST | None = None
+        if call_name in {"indicator", "factor"}:
+            factor_node = node.args[0] if node.args else _keyword(node, "name")
+        elif call_name == "get_factors":
+            factor_node = node.args[1] if len(node.args) > 1 else _keyword(node, "names")
+        for value in _literal_text_values(factor_node, static_strings):
+            factor_id = value.strip().replace("-", "_").replace(" ", "_")
+            used_factor_ids.add(factor_id)
+            if factor_id in intent.required_factor_ids and call_name in {"indicator", "factor"}:
+                requested_factor_calls.append((factor_id, node))
+    missing_factor_ids = set(intent.required_factor_ids) - used_factor_ids
+    if missing_factor_ids:
+        raise StrategyV2ContractError(
+            "strategyV2.aiRequestedFactorMissing:"
+            + ",".join(sorted(missing_factor_ids))
+        )
+    for factor_id, node in requested_factor_calls:
+        definition = _TECHNICAL_FACTOR_DEFINITIONS[factor_id]
+        schema = definition["parameter_schema"]
+        for keyword in node.keywords:
+            name = str(keyword.arg or "")
+            if name in {"name", "symbol", "frequency"}:
+                continue
+            if name not in schema:
+                raise StrategyV2ContractError(
+                    f"strategyV2.aiFactorParameterUnsupported:{factor_id}:{name or '**kwargs'}"
+                )
+            try:
+                value = ast.literal_eval(keyword.value)
+            except Exception:
+                continue
+            parameter = schema[name]
+            parameter_type = parameter.get("type")
+            invalid = (
+                (parameter_type == "integer" and (isinstance(value, bool) or not isinstance(value, int)))
+                or (parameter_type == "number" and (isinstance(value, bool) or not isinstance(value, (int, float))))
+                or (parameter_type == "boolean" and not isinstance(value, bool))
+                or (parameter_type == "enum" and value not in parameter.get("options", ()))
+                or (isinstance(value, (int, float)) and not isinstance(value, bool) and parameter.get("minimum") is not None and value < parameter["minimum"])
+                or (isinstance(value, (int, float)) and not isinstance(value, bool) and parameter.get("maximum") is not None and value > parameter["maximum"])
+            )
+            if invalid:
+                raise StrategyV2ContractError(
+                    f"strategyV2.aiFactorParameterInvalid:{factor_id}:{name}"
+                )
 
     persistence_flag = CAPABILITY_PACKS["persistent_state"].rules["module_flag"]
     if "persistent_state" in intent.capabilities and not _assignment_is_true(
