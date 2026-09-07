@@ -29,6 +29,7 @@ from app.services.strategy_ai_capabilities import (
     render_strategy_capability_repairs,
     resolve_strategy_generation_intent,
 )
+from app.services.strategy_ai_behavior import validate_strategy_ai_behavior
 from app.services.strategy_ai_workspace import (
     begin_strategy_ai_turn,
     classify_strategy_ai_intent,
@@ -313,7 +314,7 @@ def generate_strategy():
             use_json_mode=False,
         )
         code = _strip_code_fence(str(content or ""))
-        code, program = _compile_or_repair_generated_strategy(
+        code, program, behavior_validation = _compile_or_repair_generated_strategy(
             llm,
             user_prompt,
             code,
@@ -323,7 +324,14 @@ def generate_strategy():
             system_prompt=system_prompt,
             intent=generation_intent,
         )
-        return _ok({"code": code, "manifest": program.manifest.metadata()})
+        return _ok({
+            "code": code,
+            "manifest": program.manifest.metadata(),
+            "validation": {
+                "success": True,
+                "behavior": behavior_validation,
+            },
+        })
     except Exception as exc:
         logger.warning("strategy generation failed: %s", exc)
         return _error("strategyV2.generationInvalid", data={"error": str(exc)})
@@ -357,7 +365,7 @@ def _compile_or_repair_generated_strategy(
     attempts = max(0, min(int(max_repair_attempts), 3))
     for attempt in range(attempts + 1):
         try:
-            return candidate, validate_generated_strategy(
+            program = validate_generated_strategy(
                 candidate,
                 asset_type=asset_type,
                 generation_mode=generation_mode,
@@ -366,6 +374,10 @@ def _compile_or_repair_generated_strategy(
                 intent=resolved_intent,
                 compiler=compile_strategy_v2,
             )
+            behavior_validation = validate_strategy_ai_behavior(
+                candidate, program.manifest, resolved_intent
+            )
+            return candidate, program, behavior_validation
         except Exception as validation_error:
             if attempt >= attempts:
                 raise
@@ -621,7 +633,7 @@ def run_strategy_workspace_turn():
             use_json_mode=False,
         )
         candidate_code = _strip_code_fence(str(generated or ""))
-        candidate_code, program = _compile_or_repair_generated_strategy(
+        candidate_code, program, behavior_validation = _compile_or_repair_generated_strategy(
             llm,
             user_prompt,
             candidate_code,
@@ -632,7 +644,11 @@ def run_strategy_workspace_turn():
             intent=generation_intent,
         )
         manifest = program.manifest.metadata()
-        validation = {"success": True, "manifest": manifest}
+        validation = {
+            "success": True,
+            "manifest": manifest,
+            "behavior": behavior_validation,
+        }
         assistant_text = _strategy_ai_text(STRATEGY_CANDIDATE_MESSAGE_KEY, lang)
         if workspace:
             result = complete_strategy_candidate_turn(

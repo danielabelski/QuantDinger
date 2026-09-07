@@ -129,6 +129,27 @@ CAPABILITY_PACKS: dict[str, StrategyAICapability] = {
 - Add the canonical `direction_mode` declaration and keep it consistent with the implemented legs.
 """,
     ),
+    "supertrend": StrategyAICapability(
+        name="supertrend",
+        summary="Canonical platform Supertrend series and reversal semantics.",
+        rules={
+            "indicator_name": "supertrend",
+            "parameters": ["period", "multiplier", "output"],
+            "direction_output": "direction",
+            "warmup_handling": "dropna",
+        },
+        contract="""
+## Canonical Supertrend
+- Never reimplement Supertrend bands from ATR in generated strategy source. Use the platform series: `indicator("supertrend", symbol, period=period, multiplier=multiplier, output="direction", frequency=frequency)`.
+- The returned pandas Series contains warmup `NaN` values. First call `valid_trend = trend.dropna()` and return unless `len(valid_trend) >= 2`.
+- A change from a negative previous value to a positive current value is a bullish reversal. A positive-to-negative change is a bearish reversal.
+- Read `valid_trend.iloc[-2]` and `valid_trend.iloc[-1]` only after the completed-data length guard. Do not rebuild rolling bands independently on every bar.
+""",
+        repair="""
+- Replace custom ATR-band Supertrend implementations with the canonical `indicator("supertrend", ..., output="direction")` series.
+- Drop warmup `NaN` values before reading the final two direction values.
+""",
+    ),
     "bidirectional": StrategyAICapability(
         name="bidirectional",
         summary="Independent long and short behavior for direction_mode=both.",
@@ -154,21 +175,29 @@ CAPABILITY_PACKS: dict[str, StrategyAICapability] = {
         summary="Asynchronous, idempotent order tracking and reconciliation.",
         rules={
             "client_order_id_max_length": 100,
+            "client_order_id_unique_per_logical_order": True,
             "active_statuses": ["unknown", "queued", "deferred", "submitted", "open", "partial"],
             "terminal_statuses": ["filled", "rejected", "failed", "cancelled", "canceled", "expired"],
             "requires_status_check": True,
+            "status_result": {
+                "type": "mapping",
+                "status_field": "status",
+                "filled_quantity_field": "filled_quantity",
+                "filled_notional_field": "filled_notional",
+                "fee_field": "fee",
+            },
         },
         contract="""
 ## Stateful order lifecycle
 - An order function submits intent; it does not prove a fill. Active states include `unknown`, `queued`, `deferred`, `submitted`, `open`, and `partial`; `partial` is not a completed fill.
-- Orders that may be retried, cancelled, reconciled, or used to advance a cycle must pass a stable `client_order_id` of at most 100 characters and retain the returned reference.
-- Query with `get_order_status(reference)` and cancel with `cancel_order(reference)`. Treat cancellation as asynchronous.
+- Orders that may be retried, cancelled, reconciled, or used to advance a cycle must pass a stable `client_order_id` of at most 100 characters and retain the returned reference. The ID must be stable for retries of the same logical order but unique across later trading cycles; derive it from the completed-bar timestamp plus side/action instead of reusing one literal forever.
+- `get_order_status(reference)` returns a mapping, not a status string. Read `result["status"]` (and, when needed, `filled_quantity`, `filled_notional`, or `fee`). Query with the retained reference and cancel with `cancel_order(reference)`. Treat cancellation as asynchronous.
 - Advance strategy state, reuse capital, or open the opposite leg only after both a terminal order state and the synchronized position confirm the result.
 - A target crossing zero is close-then-open. Never model it as one immediately filled reversal.
 - Supported execution keywords include `reason`, `position_side`, `client_order_id`, `order_type`, `limit_price`, `execution_algo`, `maker_wait_sec`, and `maker_offset_bps`. A limit order requires a positive `limit_price`.
 """,
         repair="""
-- Add stable `client_order_id` values to tracked orders and use `get_order_status` before advancing state.
+- Add stable, per-logical-order `client_order_id` values to tracked orders and use `get_order_status(reference)["status"]` before advancing state.
 - Do not treat `partial`, a submitted order, or a cancel request as a terminal fill.
 """,
     ),
@@ -322,6 +351,11 @@ _ADVANCED_EXECUTION_TERMS = (
     "maker_wait_sec",
     "maker_offset_bps",
 )
+_SUPERTREND_TERMS = (
+    "supertrend",
+    "super trend",
+    "超级趋势",
+)
 _PERSISTENCE_TERMS = (
     "跨重启",
     "状态恢复",
@@ -384,12 +418,14 @@ def resolve_strategy_generation_intent(
 
     if re.search(r"@swap\b|usdtswap\b|usdt[ /_-]*swap\b|\bperpetual\b|永续", combined, re.IGNORECASE):
         capabilities.add("crypto_swap")
+    if _contains_any(combined, _SUPERTREND_TERMS):
+        capabilities.add("supertrend")
     if direction in {"both", "neutral"}:
         capabilities.update(("crypto_swap", "bidirectional"))
     if _contains_any(combined, _PROTECTION_TERMS):
         capabilities.add("protection")
     if _contains_any(combined, _ORDER_LIFECYCLE_TERMS):
-        capabilities.update(("advanced_execution", "order_lifecycle"))
+        capabilities.update(("advanced_execution", "order_lifecycle", "persistent_state"))
     if _contains_any(combined, _ADVANCED_EXECUTION_TERMS):
         capabilities.add("advanced_execution")
     if _contains_any(combined, _PERSISTENCE_TERMS):
@@ -510,6 +546,65 @@ def _resolved_text(node: ast.AST | None, static_strings: dict[str, str]) -> str:
     return _literal_text(node) or static_strings.get(_static_string_key(node), "")
 
 
+def _enclosing_function(
+    tree: ast.AST,
+    target: ast.AST,
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    matches = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        descendants = list(ast.walk(node))
+        if any(item is target for item in descendants):
+            matches.append((len(descendants), node))
+    return min(matches, key=lambda item: item[0])[1] if matches else None
+
+
+def _possible_text_values(
+    node: ast.AST | None,
+    tree: ast.AST,
+    static_strings: dict[str, str],
+) -> set[str]:
+    resolved = _resolved_text(node, static_strings)
+    if resolved:
+        return {resolved}
+    if isinstance(node, ast.IfExp):
+        return _possible_text_values(node.body, tree, static_strings) | _possible_text_values(
+            node.orelse, tree, static_strings
+        )
+    if not isinstance(node, ast.Name):
+        return set()
+    function = _enclosing_function(tree, node)
+    if function is None:
+        return set()
+    parameters = [*function.args.posonlyargs, *function.args.args]
+    parameter_index = next(
+        (index for index, item in enumerate(parameters) if item.arg == node.id),
+        None,
+    )
+    if parameter_index is None:
+        return set()
+    invocations = [
+        call
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call) and _call_name(call) == function.name
+    ]
+    if not invocations:
+        return set()
+    values: set[str] = set()
+    for call in invocations:
+        argument = (
+            call.args[parameter_index]
+            if len(call.args) > parameter_index
+            else _keyword(call, node.id)
+        )
+        value = _resolved_text(argument, static_strings)
+        if not value:
+            return set()
+        values.add(value)
+    return values
+
+
 def _literal_number(node: ast.AST | None) -> float | None:
     try:
         value = ast.literal_eval(node) if node is not None else None
@@ -566,6 +661,38 @@ def _assigned_key_for_call(tree: ast.AST, target_call: ast.Call) -> str:
         if len(targets) == 1:
             return _static_string_key(targets[0])
     return ""
+
+
+def _status_result_field_is_read(
+    tree: ast.AST,
+    target_call: ast.Call,
+    static_strings: dict[str, str],
+) -> bool:
+    assigned_key = _assigned_key_for_call(tree, target_call)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript):
+            same_result = node.value is target_call
+            assigned_result = (
+                bool(assigned_key)
+                and _static_string_key(node.value) == assigned_key
+            )
+            if (same_result or assigned_result) and _resolved_text(
+                node.slice, static_strings
+            ) == "status":
+                return True
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "get" or not node.args:
+            continue
+        same_result = node.func.value is target_call
+        assigned_result = (
+            bool(assigned_key)
+            and _static_string_key(node.func.value) == assigned_key
+        )
+        if same_result or assigned_result:
+            if _resolved_text(node.args[0], static_strings) == "status":
+                return True
+    return False
 
 
 def _has_effective_protection(node: ast.Call) -> bool:
@@ -775,39 +902,51 @@ def validate_strategy_ai_semantics(
                 raise StrategyV2ContractError(
                     f"strategyV2.aiSwapPositionSideRequired:{_call_name(node)}"
                 )
-            literal_side = _resolved_text(side_node, static_strings)
-            if literal_side not in valid_position_sides:
+            possible_sides = _possible_text_values(side_node, tree, static_strings)
+            if not possible_sides or not possible_sides.issubset(valid_position_sides):
                 raise StrategyV2ContractError("strategyV2.aiPositionSideInvalid")
-        order_sides = {
-            side
-            for node in swap_order_calls
-            if (side := _resolved_text(_keyword(node, "position_side"), static_strings))
-            in valid_position_sides
-        }
+        for node in swap_order_calls:
+            order_sides.update(
+                _possible_text_values(
+                    _keyword(node, "position_side"), tree, static_strings
+                )
+                & valid_position_sides
+            )
 
     required_bidirectional_sides = set(
         CAPABILITY_PACKS["bidirectional"].rules["required_order_sides"]
     )
     open_sides: set[str] = set()
+    protected_open_sides: set[str] = set()
     for node in order_calls:
-        side = _resolved_text(_keyword(node, "position_side"), static_strings)
+        possible_sides = _possible_text_values(
+            _keyword(node, "position_side"), tree, static_strings
+        )
         value_node = _order_value_node(node)
         static_values = _numeric_values(value_node, assignment_expressions)
         nonzero_values = {value for value in static_values if abs(value) > 1e-12}
-        if side == "long" and any(value > 0 for value in nonzero_values):
-            open_sides.add(side)
-        elif side == "short" and any(value < 0 for value in nonzero_values):
-            open_sides.add(side)
-        elif side in valid_position_sides and not static_values and not _is_definitely_zero(
+        opening_sides: set[str] = set()
+        if "long" in possible_sides and any(value > 0 for value in nonzero_values):
+            opening_sides.add("long")
+        if "short" in possible_sides and any(value < 0 for value in nonzero_values):
+            opening_sides.add("short")
+        if possible_sides and not static_values and not _is_definitely_zero(
             value_node, assignment_expressions
         ):
-            open_sides.add(side)
+            opening_sides.update(possible_sides & valid_position_sides)
+        open_sides.update(opening_sides)
+        if opening_sides and _has_effective_protection(node):
+            protected_open_sides.update(opening_sides)
         target_order = _call_name(node).startswith("order_target")
-        if target_order and side == "long" and any(value < 0 for value in nonzero_values):
+        if target_order and "long" in possible_sides and any(
+            value < 0 for value in nonzero_values
+        ):
             raise StrategyV2ContractError(
                 "strategyV2.aiDirectionModeOrderMismatch:long:negativeTarget"
             )
-        if target_order and side == "short" and any(value > 0 for value in nonzero_values):
+        if target_order and "short" in possible_sides and any(
+            value > 0 for value in nonzero_values
+        ):
             raise StrategyV2ContractError(
                 "strategyV2.aiDirectionModeOrderMismatch:short:positiveTarget"
             )
@@ -821,6 +960,20 @@ def validate_strategy_ai_semantics(
         raise StrategyV2ContractError("strategyV2.aiDirectionModeOrderMismatch:long_only:short")
     if direction_mode == "short_only" and "long" in order_sides:
         raise StrategyV2ContractError("strategyV2.aiDirectionModeOrderMismatch:short_only:long")
+
+    if "protection" in intent.capabilities and swap_scope:
+        if direction_mode == "long_only":
+            required_protected_sides = {"long"}
+        elif direction_mode == "short_only":
+            required_protected_sides = {"short"}
+        else:
+            required_protected_sides = set(required_bidirectional_sides)
+        missing_protection = required_protected_sides - protected_open_sides
+        if missing_protection:
+            raise StrategyV2ContractError(
+                "strategyV2.aiProtectionEntryLegsRequired:"
+                + ",".join(sorted(missing_protection))
+            )
 
     for node in order_calls:
         reason = _keyword(node, "reason")
@@ -889,6 +1042,17 @@ def validate_strategy_ai_semantics(
         if not has_protection:
             raise StrategyV2ContractError("strategyV2.aiProtectionImplementationRequired")
 
+    if "supertrend" in intent.capabilities:
+        native_supertrend = any(
+            _call_name(node) == "indicator"
+            and bool(node.args)
+            and _resolved_text(node.args[0], static_strings) == "supertrend"
+            and _resolved_text(_keyword(node, "output"), static_strings) == "direction"
+            for node in calls
+        )
+        if not native_supertrend:
+            raise StrategyV2ContractError("strategyV2.aiSupertrendNativeRequired")
+
     persistence_flag = CAPABILITY_PACKS["persistent_state"].rules["module_flag"]
     if "persistent_state" in intent.capabilities and not _assignment_is_true(
         tree, persistence_flag
@@ -903,6 +1067,8 @@ def validate_strategy_ai_semantics(
             for node in order_calls
             if (value := _resolved_text(_keyword(node, "client_order_id"), static_strings))
         }
+        if direction_mode in {"both", "neutral"} and client_ids:
+            raise StrategyV2ContractError("strategyV2.aiClientOrderIdMustVary")
         order_reference_keys = {
             key for node in order_calls if (key := _assigned_key_for_call(tree, node))
         }
@@ -918,6 +1084,8 @@ def validate_strategy_ai_semantics(
             if reference_key not in order_reference_keys and reference_value not in client_ids:
                 raise StrategyV2ContractError("strategyV2.aiOrderStatusCheckRequired")
             if _call_name(node) == "get_order_status":
+                if not _status_result_field_is_read(tree, node, static_strings):
+                    raise StrategyV2ContractError("strategyV2.aiOrderStatusFieldRequired")
                 valid_status_check = True
         if not valid_status_check:
             raise StrategyV2ContractError("strategyV2.aiOrderStatusCheckRequired")

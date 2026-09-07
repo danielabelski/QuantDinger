@@ -70,6 +70,13 @@ def test_perpetual_alias_without_canonical_context_loads_swap_capability():
         assert "crypto_swap" in intent.capabilities
 
 
+def test_supertrend_request_loads_the_canonical_indicator_capability():
+    intent = resolve_strategy_generation_intent(prompt="构建 ETH 永续 Supertrend 策略")
+
+    assert "supertrend" in intent.capabilities
+    assert "crypto_swap" in intent.capabilities
+
+
 def test_generation_prompt_injects_only_relevant_capability_packs():
     stock_prompt, stock_intent = build_strategy_system_prompt(
         prompt="生成 SPY 日线均线策略",
@@ -267,6 +274,28 @@ def test_unresolved_dynamic_swap_side_is_rejected_in_strict_authoring():
         )
 
 
+def test_helper_position_side_is_resolved_from_literal_call_sites():
+    source = _swap_source(body='''    submit(g.symbol, "long", 0.4)
+    submit(g.symbol, "short", -0.4)''') + '''
+
+def submit(symbol, side, target):
+    order_target_percent(
+        symbol,
+        target,
+        position_side=side,
+        reason="helper_target",
+    )
+'''
+
+    program = validate_generated_strategy(
+        source,
+        asset_type="script",
+        prompt="改成多空双向",
+    )
+
+    assert program.manifest.direction_mode == "both"
+
+
 def test_mixed_universe_enforces_position_side_only_for_swap_calls():
     source = '''"""Mixed Universe Position Side Test"""
 
@@ -347,9 +376,13 @@ def test_order_lifecycle_requires_ids_and_linked_status_checks():
         g.symbol, 0.4, position_side="long", reason="entry"
     )
     get_order_status(order_ref)'''
+    lifecycle_source = "PERSIST_RUNTIME_STATE = True\n\n" + _swap_source(
+        direction_mode="long_only",
+        body=without_id,
+    )
     with pytest.raises(StrategyV2ContractError, match="aiClientOrderIdRequired"):
         validate_generated_strategy(
-            _swap_source(direction_mode="long_only", body=without_id),
+            lifecycle_source,
             asset_type="script",
             prompt="增加订单状态检查",
         )
@@ -360,20 +393,82 @@ def test_order_lifecycle_requires_ids_and_linked_status_checks():
     ).replace("get_order_status(order_ref)", 'get_order_status("some-other-id")')
     with pytest.raises(StrategyV2ContractError, match="aiOrderStatusCheckRequired"):
         validate_generated_strategy(
-            _swap_source(direction_mode="long_only", body=unrelated_status),
+            "PERSIST_RUNTIME_STATE = True\n\n"
+            + _swap_source(direction_mode="long_only", body=unrelated_status),
             asset_type="script",
             prompt="增加订单状态检查",
         )
 
     linked_status = unrelated_status.replace(
         'get_order_status("some-other-id")',
-        "get_order_status(order_ref)",
+        'status = get_order_status(order_ref)\n    status["status"]',
     )
     validate_generated_strategy(
-        _swap_source(direction_mode="long_only", body=linked_status),
+        "PERSIST_RUNTIME_STATE = True\n\n"
+        + _swap_source(direction_mode="long_only", body=linked_status),
         asset_type="script",
         prompt="增加订单状态检查",
     )
+
+
+def test_order_status_mapping_must_read_its_status_field():
+    body = '''    order_ref = order_target_percent(
+        g.symbol,
+        0.4,
+        position_side="long",
+        client_order_id="entry-1",
+        reason="entry",
+    )
+    status = get_order_status(order_ref)
+    if status == "filled":
+        log.info("filled")'''
+    source = "PERSIST_RUNTIME_STATE = True\n\n" + _swap_source(
+        direction_mode="long_only",
+        body=body,
+    )
+
+    with pytest.raises(StrategyV2ContractError, match="aiOrderStatusFieldRequired"):
+        validate_generated_strategy(source, asset_type="script", prompt="检查订单状态")
+
+
+def test_bidirectional_lifecycle_ids_must_vary_by_logical_order():
+    body = '''    long_ref = order_target_percent(
+        g.symbol,
+        0.4,
+        position_side="long",
+        client_order_id="long-open",
+        reason="long_entry",
+    )
+    short_ref = order_target_percent(
+        g.symbol,
+        -0.4,
+        position_side="short",
+        client_order_id="short-open",
+        reason="short_entry",
+    )
+    long_status = get_order_status(long_ref)
+    short_status = get_order_status(short_ref)
+    long_status["status"]
+    short_status["status"]'''
+    source = "PERSIST_RUNTIME_STATE = True\n\n" + _swap_source(body=body)
+
+    with pytest.raises(StrategyV2ContractError, match="aiClientOrderIdMustVary"):
+        validate_generated_strategy(source, asset_type="script", prompt="多空订单状态对账")
+
+
+def test_custom_supertrend_reimplementation_is_rejected():
+    body = '''    atr = indicator("ATR", g.symbol, timeperiod=10)
+    if len(atr) > 2:
+        order_target_percent(
+            g.symbol, 0.4, position_side="long", reason="long_entry"
+        )'''
+
+    with pytest.raises(StrategyV2ContractError, match="aiSupertrendNativeRequired"):
+        validate_generated_strategy(
+            _swap_source(direction_mode="long_only", body=body),
+            asset_type="script",
+            prompt="创建 Supertrend 策略",
+        )
 
 
 def test_protection_dictionary_is_valid_executable_protection():
@@ -475,6 +570,7 @@ def test_external_authoring_contract_exports_same_capability_catalog():
         "protection",
         "persistent_state",
         "scheduling",
+        "supertrend",
     }
     assert contract["capability_packs"]["crypto_swap"]["rules"]["position_sides"] == [
         "long",
