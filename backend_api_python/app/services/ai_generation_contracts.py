@@ -33,6 +33,8 @@ Return Python source only. Do not use markdown fences or explanatory prose.
 - Parameters may control signal periods, thresholds, target weights, stops, take profit, trailing protection, cooldowns, and bounded layer counts.
 - Do not disguise universe, symbol, market type, frequency, leverage permission, initial capital, date range, commission, or slippage as ordinary strategy parameters.
 - Use `context.set_metadata(...)` in `initialize` for stable descriptive metadata such as direction mode and strategy family, passing keyword arguments such as `context.set_metadata(direction_mode="long_only", strategy_family="trend")`. Metadata is not a substitute for executable risk logic.
+- `direction_mode` accepts exactly `long_only`, `short_only`, `both`, or `neutral`. Requests for long-and-short, both directions, bidirectional trading, `多空双向`, or `双向/多空` map to `direction_mode="both"`; never invent another direction-mode literal.
+- Keep direction metadata consistent with executable order behavior. A `both` strategy must implement genuine long and short entries/exits; changing only the metadata does not make a long-only strategy bidirectional.
 
 ## Data and factors
 - Historical-bar signatures are exact: `get_history(count, frequency=None, field=None, security_list=None)` and the default form `data.history(symbols, count, fields=None)`. Multi-timeframe data views add the optional keyword `frequency=None` to `data.history`.
@@ -151,6 +153,8 @@ SCRIPT_STRATEGY_REPAIR_REQUIREMENTS = """# Strategy API V2 repair requirements
 - Keep symbol, market, frequency, schedule, and universe in source code.
 - Permit user-adjustable leverage only for Crypto `@swap` instruments and only after `context.allow_leverage(max_leverage=N)`.
 - Reject leverage for Crypto spot and every non-Crypto market.
+- `direction_mode` accepts exactly `long_only`, `short_only`, `both`, or `neutral`. Map long-and-short, both directions, bidirectional trading, `多空双向`, and `双向/多空` to `context.set_metadata(direction_mode="both")`; never preserve or invent any other literal while repairing.
+- Keep direction metadata consistent with executable order behavior. Repair a requested `both` strategy so that it contains real long and short entry/exit behavior rather than changing metadata alone.
 - Keep long exits separate from short entries and do not invent reversals.
 - Do not use unsafe file, network, reflection, dynamic execution, or process APIs.
 """
